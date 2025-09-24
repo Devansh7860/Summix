@@ -299,147 +299,271 @@ def ask(video_id, playlist_id, question, userId, api_key):
 
 
 
-async def fetch_transcript_async(video_id, api_key):
-    try:
-        def _fetch_transcript_sync(vid):
-            print(f"Async: Fetching transcript for video ID: {vid}")
-            video_url = f"https://www.youtube.com/watch?v={vid}"
+# ============================================================================
+# STREAMING PIPELINE INFRASTRUCTURE
+# ============================================================================
+
+class VideoData:
+    """Container for video data flowing through the pipeline"""
+    def __init__(self, video_id, playlist_id, userId, api_key):
+        self.video_id = video_id
+        self.playlist_id = playlist_id
+        self.userId = userId  
+        self.api_key = api_key
+        self.transcript = None
+        self.summary = None
+        self.error = None
+        self.cached = False
+
+async def translate_stage_worker(input_queue, output_queue, userId, playlist_id, api_key):
+    """Worker for translating transcripts (if needed)"""
+    while True:
+        video_data = await input_queue.get()
+        if video_data is None:  # Sentinel value to stop worker
+            input_queue.task_done()
+            break
             
-            # Use get_transcript to fetch the transcript
-            transcript = get_transcript(video_url)
-            if not transcript:
-                print(f"No transcript available for video ID: {vid}")
-                return None
+        try:
+            # Check cancellation before processing
+            if is_task_cancelled(userId, playlist_id, is_playlist=True):
+                video_data.error = "Task cancelled during translation"
+                await output_queue.put(video_data)
+                input_queue.task_done()
+                continue
                 
-            # Simple detection for Hindi script
-            hindi_chars = set('अआइईउऊऋएऐओऔकखगघचछजझटठडढणतथदधनपफबभमयरलवशषसह')
-            if any(char in hindi_chars for char in transcript[:1000]):
-                print(f"Async: Hindi transcript detected for video ID: {vid}, translating...")
-                english_transcript = translate_hindi_to_english(transcript, api_key)
-                return english_transcript
+            # Skip if there's an error from previous stage
+            if video_data.error:
+                await output_queue.put(video_data)
+                input_queue.task_done()
+                continue
                 
-            return transcript
-        
-        transcript = await asyncio.to_thread(_fetch_transcript_sync, video_id)
-        return video_id, transcript
-
-    except Exception as e:
-        print(f"Error fetching transcript for {video_id}: {e}")
-        return video_id, None
-
-async def summarizePlaylist(playlist_id, userId, api_key):
-    print("Summarizing playlist:", playlist_id)
-    
-    # Register this task
-    register_task(userId, playlist_id, is_playlist=True)
-    
-    try:
-        # Check if playlist summary already exists in centralized vector store
-        cached_summary = fetcher._get_cached_summary_from_vector_store(playlist_id=playlist_id)
-        if cached_summary:
-            print("📦 Found cached playlist summary in centralized vector store")
-            unregister_task(userId, playlist_id, is_playlist=True)
-            return cached_summary
-        
-        playlist_url = "https://www.youtube.com/playlist?list=" + playlist_id
-        playlist = Playlist(playlist_url)
-        video_urls = [f"https://www.youtube.com/watch?v={video.video_id}" for video in playlist.videos]
-
-        # Check for cancellation after fetching playlist info
-        if is_task_cancelled(userId, playlist_id, is_playlist=True):
-            print(f"Task cancelled: summarize playlist {playlist_id} - after fetching video IDs")
-            unregister_task(userId, playlist_id, is_playlist=True)
-            return "Task was cancelled"
-
-        print(f"🚀 Using optimized playlist transcript fetching for {len(video_urls)} videos...")
-        
-        # Use the optimized playlist fetching method (already using centralized caching)
-        def _fetch_playlist_sync():
-            return fetcher.get_playlist_transcripts(video_urls)
-        
-        # Run the optimized playlist fetching in a thread
-        transcript_results = await asyncio.to_thread(_fetch_playlist_sync)
-        
-        # Check for cancellation after transcripts fetched
-        if is_task_cancelled(userId, playlist_id, is_playlist=True):
-            print(f"Task cancelled: summarize playlist {playlist_id} - after fetching transcripts")
-            unregister_task(userId, playlist_id, is_playlist=True)
-            return "Task was cancelled"
-        
-        # Process results and handle translations
-        video_transcripts = []
-        for video_url, transcript in transcript_results.items():
-            if transcript:
-                video_id = video_url.split('v=')[1] if 'v=' in video_url else video_url
-                
+            print(f"🔄 Processing transcript for video {video_data.video_id} (translation stage)")
+            
+            # Check if Hindi translation is needed
+            if video_data.transcript:
                 # Simple detection for Hindi script
                 hindi_chars = set('अआइईउऊऋएऐओऔकखगघचछजझटठडढणतथदधनपफबभमयरलवशषसह')
-                if any(char in hindi_chars for char in transcript[:1000]):
-                    print(f"Hindi transcript detected for video ID: {video_id}, translating...")
-                    transcript = translate_hindi_to_english(transcript, api_key)
-                
-                video_transcripts.append((video_id, transcript))
-        
-        if not video_transcripts:
-            unregister_task(userId, playlist_id, is_playlist=True)
-            return "No transcripts available for any videos in this playlist."
-
-        # Generate summaries concurrently with limit
-        semaphore = asyncio.Semaphore(5)  # Max 5 concurrent operations
-        model = create_model(api_key)
-        chain = prompt | model | parser
-        
-        async def generate_summary_with_limit(vid, transcript):
-            # Check cancellation before starting each summary
-            if is_task_cancelled(userId, playlist_id, is_playlist=True):
-                return f"Cancelled summary for video {vid}"
-                
-            async with semaphore:
-                try:
-                    # Check if summary already cached in centralized store
-                    cached_summary = fetcher._get_cached_summary_from_vector_store(video_id=vid)
-                    if cached_summary:
-                        print(f"📦 Using cached summary for video {vid}")
-                        return cached_summary
-                    
-                    print(f"Generating summary for video ID: {vid}")
-                    summary = await asyncio.to_thread(chain.invoke, {"context": transcript})
-                    
-                    # Check cancellation after generating summary
-                    if is_task_cancelled(userId, playlist_id, is_playlist=True):
-                        return f"Cancelled after summary for video {vid}"
-                    
-                    # Cache summary to centralized vector store
-                    fetcher._cache_summary_to_vector_store(summary, video_id=vid, playlist_id=playlist_id)
-                    return summary
-                except Exception as e:
-                    print(f"Error generating summary for {vid}: {e}")
-                    return f"Error generating summary for video {vid}"
-
-        summary_tasks = [generate_summary_with_limit(vid, transcript) for vid, transcript in video_transcripts]
-        summaries = await asyncio.gather(*summary_tasks, return_exceptions=True)
-        
-        # Check for cancellation after all summaries generated
-        if is_task_cancelled(userId, playlist_id, is_playlist=True):
-            print(f"Task cancelled: summarize playlist {playlist_id} - after generating summaries")
-            unregister_task(userId, playlist_id, is_playlist=True)
-            return "Task was cancelled"
-        
-        # Filter out exceptions and cancellations
-        valid_summaries = [s for s in summaries if not isinstance(s, Exception) and not s.startswith("Cancelled")]
-        
-        combined_summaries = "\n\n".join(
-            [f"Video {i+1}: {summary}" for i, summary in enumerate(valid_summaries)]
-        )
-        
-        # Check for cancellation before final summary
-        if is_task_cancelled(userId, playlist_id, is_playlist=True):
-            print(f"Task cancelled: summarize playlist {playlist_id} - before final summary")
-            unregister_task(userId, playlist_id, is_playlist=True)
-            return "Task was cancelled"
+                if any(char in hindi_chars for char in video_data.transcript[:1000]):
+                    print(f"Hindi transcript detected for video ID: {video_data.video_id}, translating...")
+                    try:
+                        def _translate_sync():
+                            return translate_hindi_to_english(video_data.transcript, api_key)
+                        
+                        translated_transcript = await asyncio.to_thread(_translate_sync)
+                        video_data.transcript = translated_transcript
+                        print(f"✅ Successfully translated transcript for video {video_data.video_id}")
+                    except Exception as e:
+                        print(f"❌ Error translating transcript for {video_data.video_id}: {e}")
+                        # Continue with original transcript if translation fails
+                        
+        except Exception as e:
+            video_data.error = f"Error in translation stage: {e}"
+            print(f"❌ Error in translation stage for {video_data.video_id}: {e}")
             
-        prompt2 = PromptTemplate(
-            template="""You are an expert summarizer and teacher. 
+        await output_queue.put(video_data)
+        input_queue.task_done()
+
+async def summarize_stage_worker(input_queue, output_queue, userId, playlist_id, api_key):
+    """Worker for generating summaries"""
+    while True:
+        video_data = await input_queue.get()
+        if video_data is None:  # Sentinel value to stop worker
+            input_queue.task_done()
+            break
+            
+        try:
+            # Check cancellation before processing
+            if is_task_cancelled(userId, playlist_id, is_playlist=True):
+                video_data.error = "Task cancelled during summarization"
+                await output_queue.put(video_data)
+                input_queue.task_done()
+                continue
+                
+            # Skip if there's an error from previous stage
+            if video_data.error:
+                await output_queue.put(video_data)
+                input_queue.task_done()
+                continue
+                
+            print(f"🔄 Generating summary for video {video_data.video_id}")
+            
+            # Check cache first
+            cached_summary = fetcher._get_cached_summary_from_vector_store(video_id=video_data.video_id)
+            if cached_summary:
+                print(f"📦 Using cached summary for video {video_data.video_id}")
+                video_data.summary = cached_summary
+                video_data.cached = True
+            else:
+                # Generate new summary
+                prompt = PromptTemplate(
+                    template="""You are an expert summarizer and teacher. treat user like a bro. keep language semi formal but friendly and chill.
+
+I'll provide you with a transcript from a YouTube video. Your task is to create a comprehensive summary that includes:
+
+1. **Main Topic & Purpose**: What is this video about and what is its primary goal?
+
+2. **Key Concepts & Ideas**: List the main concepts, ideas, or topics covered (use bullet points)
+
+3. **Important Details**: Any specific facts, examples, or explanations that are crucial for understanding
+
+4. **Practical Takeaways**: What should someone remember or apply after watching this video?
+
+Please make sure your summary is:
+- Clear and well-structured  
+- Comprehensive but concise
+- Educational and easy to understand
+- Written in a friendly, approachable tone
+
+Transcript: {context}""",
+                    input_variables=["context"]
+                )
+                
+                model = create_model(api_key)
+                chain = prompt | model | parser
+                summary = await asyncio.to_thread(chain.invoke, {"context": video_data.transcript})
+                
+                # Cache summary to centralized vector store
+                fetcher._cache_summary_to_vector_store(summary, video_id=video_data.video_id, playlist_id=playlist_id)
+                video_data.summary = summary
+                print(f"✅ Successfully generated summary for video {video_data.video_id}")
+                
+        except Exception as e:
+            video_data.error = f"Error generating summary: {e}"
+            print(f"❌ Error generating summary for {video_data.video_id}: {e}")
+            
+        await output_queue.put(video_data)
+        input_queue.task_done()
+
+async def streaming_playlist_pipeline(playlist_id, userId, api_key, max_concurrent=3):
+    """
+    Hybrid streaming pipeline that uses optimized batch fetching + streaming processing
+    Stage 1: Optimized concurrent transcript fetching (batch)  
+    Stage 2: Streaming translate → summarize → collect
+    """
+    print(f"🚀 Starting hybrid streaming pipeline for playlist {playlist_id}")
+    
+    # STAGE 1: Use optimized batch transcript fetching (already concurrent & optimized)
+    try:
+        playlist = Playlist(f"https://www.youtube.com/playlist?list={playlist_id}")
+        video_urls = list(playlist.video_urls)
+        total_videos = len(video_urls)
+        
+        if total_videos == 0:
+            print("❌ No videos found in playlist")
+            return None
+            
+        print(f"📋 Found {total_videos} videos in playlist")
+        print(f"🔄 Stage 1: Fetching all transcripts using optimized batch method...")
+        
+        # Use the existing optimized batch fetching
+        def _fetch_transcripts_batch():
+            return fetcher.get_playlist_transcripts(video_urls)
+        
+        transcript_results = await asyncio.to_thread(_fetch_transcripts_batch)
+        
+        # Convert results to VideoData objects with transcripts
+        video_data_list = []
+        for video_url, transcript in transcript_results.items():
+            video_id = video_url.split("v=")[1].split("&")[0] if "v=" in video_url else video_url.split("/")[-1]
+            video_data = VideoData(video_id, playlist_id, userId, api_key)
+            
+            if transcript:
+                video_data.transcript = transcript
+                video_data_list.append(video_data)
+                print(f"✅ Transcript ready for video {video_id}")
+            else:
+                video_data.error = f"No transcript available for video {video_id}"
+                video_data_list.append(video_data)
+                print(f"❌ No transcript for video {video_id}")
+        
+        print(f"📊 Stage 1 complete: {len([v for v in video_data_list if v.transcript])}/{total_videos} transcripts fetched")
+        
+    except Exception as e:
+        print(f"❌ Error in batch transcript fetching: {e}")
+        return None
+    
+    # STAGE 2: Streaming processing pipeline (translate → summarize → collect)
+    print(f"🔄 Stage 2: Starting streaming processing pipeline...")
+    
+    translate_queue = asyncio.Queue()
+    summarize_queue = asyncio.Queue() 
+    results_queue = asyncio.Queue()
+    
+    # Add all video data to translate queue
+    for video_data in video_data_list:
+        await translate_queue.put(video_data)
+    
+    # Start worker tasks for streaming stages
+    num_workers = min(max_concurrent, len(video_data_list))
+    
+    # Translate stage workers  
+    translate_workers = []
+    for i in range(num_workers):
+        worker = asyncio.create_task(
+            translate_stage_worker(translate_queue, summarize_queue, userId, playlist_id, api_key)
+        )
+        translate_workers.append(worker)
+    
+    # Summarize stage workers
+    summarize_workers = []
+    for i in range(num_workers):
+        worker = asyncio.create_task(
+            summarize_stage_worker(summarize_queue, results_queue, userId, playlist_id, api_key)
+        )
+        summarize_workers.append(worker)
+    
+    # Collect results from streaming processing
+    completed_videos = []
+    videos_processed = 0
+    
+    try:
+        while videos_processed < len(video_data_list):
+            # Check for cancellation
+            if is_task_cancelled(userId, playlist_id, is_playlist=True):
+                print("❌ Task cancelled during streaming processing")
+                break
+                
+            # Get completed video
+            video_data = await results_queue.get()
+            videos_processed += 1
+            
+            if video_data.error:
+                print(f"❌ Video {video_data.video_id} failed: {video_data.error}")
+            elif video_data.summary:
+                completed_videos.append(video_data)
+                print(f"✅ Completed video {video_data.video_id} ({videos_processed}/{len(video_data_list)})")
+            
+            results_queue.task_done()
+            
+        print(f"📊 Stage 2 complete: {len(completed_videos)}/{len(video_data_list)} videos processed successfully")
+        
+    finally:
+        # Stop all workers by sending sentinel values
+        for _ in range(num_workers):
+            await translate_queue.put(None)
+            await summarize_queue.put(None)
+            
+        # Wait for all workers to finish
+        await asyncio.gather(*translate_workers, *summarize_workers, return_exceptions=True)
+        
+    return completed_videos
+
+async def generate_final_playlist_summary(completed_videos, playlist_id, api_key):
+    """Generate final playlist summary from completed video summaries"""
+    if not completed_videos:
+        return "No videos were successfully processed."
+        
+    print(f"📋 Generating final playlist summary from {len(completed_videos)} videos")
+    
+    # Combine all individual summaries
+    combined_summaries = "\n\n".join([
+        f"Video {i+1}: {video_data.summary}" 
+        for i, video_data in enumerate(completed_videos)
+    ])
+    
+    # Create final summary prompt
+    prompt2 = PromptTemplate(
+        template="""You are an expert summarizer and teacher. 
 I will provide you with summaries of multiple videos from a playlist.treat user like a bro. keep language semi formal but friendly and chill.
 
 Your task is to generate a structured final summary in two parts:
@@ -459,25 +583,77 @@ Your task is to generate a structured final summary in two parts:
    - Make sure to keep the language simple, precise, and educational.  
 
 summaries: {combined_summaries}""",
+        input_variables=["combined_summaries"]
+    )
 
-            input_variables=["combined_summaries"]
-        )
+    # Generate final summary
+    final_model = create_model(api_key)
+    final_chain = prompt2 | final_model | parser
+    final_summary = await asyncio.to_thread(final_chain.invoke, {"combined_summaries": combined_summaries})
+    
+    # Cache playlist summary to centralized vector store
+    print("💾 Caching playlist summary to centralized vector store...")
+    fetcher._cache_summary_to_vector_store(final_summary, playlist_id=playlist_id)
+    
+    return final_summary
 
-        final_model = create_model(api_key)
-        final_chain = prompt2 | final_model | parser
-        final_summary = await asyncio.to_thread(final_chain.invoke, {"combined_summaries": combined_summaries})
+async def summarizePlaylist(playlist_id, userId, api_key):
+    """
+    Streaming playlist summarizer that processes videos through concurrent pipeline stages
+    Each video flows through: fetch → translate → summarize → collect
+    """
+    print("🚀 Starting streaming playlist summarization:", playlist_id)
+    
+    # Register this task
+    register_task(userId, playlist_id, is_playlist=True)
+    
+    try:
+        # Check if playlist summary already exists in centralized vector store
+        cached_summary = fetcher._get_cached_summary_from_vector_store(playlist_id=playlist_id)
+        if cached_summary:
+            print("📦 Found cached playlist summary in centralized vector store")
+            unregister_task(userId, playlist_id, is_playlist=True)
+            return cached_summary
         
-        # Cache playlist summary to centralized vector store
-        print("💾 Caching playlist summary to centralized vector store...")
-        fetcher._cache_summary_to_vector_store(final_summary, playlist_id=playlist_id)
+        # Check for cancellation before starting pipeline
+        if is_task_cancelled(userId, playlist_id, is_playlist=True):
+            print(f"Task cancelled: summarize playlist {playlist_id} - before starting pipeline")
+            unregister_task(userId, playlist_id, is_playlist=True)
+            return "Task was cancelled"
+        
+        # Run streaming pipeline
+        print("🔄 Starting streaming pipeline...")
+        completed_videos = await streaming_playlist_pipeline(playlist_id, userId, api_key, max_concurrent=3)
+        
+        # Check for cancellation after pipeline
+        if is_task_cancelled(userId, playlist_id, is_playlist=True):
+            print(f"Task cancelled: summarize playlist {playlist_id} - after pipeline")
+            unregister_task(userId, playlist_id, is_playlist=True)
+            return "Task was cancelled"
+        
+        # Handle case where no videos were processed successfully
+        if not completed_videos:
+            unregister_task(userId, playlist_id, is_playlist=True)
+            return "No videos could be processed successfully from this playlist."
+        
+        # Generate final playlist summary
+        print("🔄 Generating final playlist summary...")
+        final_summary = await generate_final_playlist_summary(completed_videos, playlist_id, api_key)
+        
+        # Final cancellation check
+        if is_task_cancelled(userId, playlist_id, is_playlist=True):
+            print(f"Task cancelled: summarize playlist {playlist_id} - after final summary")
+            unregister_task(userId, playlist_id, is_playlist=True)
+            return "Task was cancelled"
         
         # Unregister completed task
         unregister_task(userId, playlist_id, is_playlist=True)
+        print(f"✅ Playlist summarization completed successfully!")
         return final_summary
         
     except Exception as e:
         # Make sure to unregister on error
         unregister_task(userId, playlist_id, is_playlist=True)
-        print(f"Error in summarizePlaylist: {e}")
+        print(f"❌ Error in summarizePlaylist: {e}")
         raise e
  

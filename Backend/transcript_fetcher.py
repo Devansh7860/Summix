@@ -92,14 +92,14 @@ class TranscriptFetcher:
         transcript = None
         
         # Method 1: YouTube Transcript API (fastest and most reliable)
-        if method in ["auto", "api"] and self.api_fetcher.is_available():
-            print("Trying YouTube Transcript API...")
-            transcript = self.api_fetcher.fetch_transcript(video_id)
-            if transcript:
-                print("Successfully fetched via YouTube Transcript API")
-                if use_cache:
-                    self._cache_transcript_to_vector_store(video_id, transcript, method="api")
-                return transcript
+        # if method in ["auto", "api"] and self.api_fetcher.is_available():
+        #     print("Trying YouTube Transcript API...")
+        #     transcript = self.api_fetcher.fetch_transcript(video_id)
+        #     if transcript:
+        #         print("Successfully fetched via YouTube Transcript API")
+        #         if use_cache:
+        #             self._cache_transcript_to_vector_store(video_id, transcript, method="api")
+        #         return transcript
         
         # Method 2: Web scraping (reliable fallback, skip yt-dlp to avoid 429 errors)
         if method in ["auto", "web"] and not transcript:
@@ -153,16 +153,16 @@ class TranscriptFetcher:
             
             # Try API method first for all uncached videos (fastest & most reliable)
             api_results = {}
-            for url in uncached_urls:
-                video_id = extract_video_id(url)
-                if video_id:
-                    print(f"Trying API for {video_id}...")
-                    transcript = self.api_fetcher.fetch_transcript(video_id)
-                    if transcript:
-                        api_results[url] = transcript
-                        if use_cache:
-                            self._cache_transcript_to_vector_store(video_id, transcript, method="api")
-                        print(f"API success for {video_id}")
+            # for url in uncached_urls:
+            #     video_id = extract_video_id(url)
+            #     if video_id:
+            #         print(f"Trying API for {video_id}...")
+            #         transcript = self.api_fetcher.fetch_transcript(video_id)
+            #         if transcript:
+            #             api_results[url] = transcript
+            #             if use_cache:
+            #                 self._cache_transcript_to_vector_store(video_id, transcript, method="api")
+            #             print(f"API success for {video_id}")
             
             # Update results and find videos that still need transcripts
             results.update(api_results)
