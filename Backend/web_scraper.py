@@ -277,11 +277,100 @@ class WebTranscriptScraper:
             copy_button_selector = '#copy-transcript'
             await page.wait_for_selector(copy_button_selector, timeout=30000)
             
+            # Give the page a moment to fully render after transcript appears
+            await page.wait_for_timeout(2000)
+            
+            # Handle any popup banners that might appear after transcript loading
+            await self._handle_post_transcript_popups(page)
+            
             # Scroll to the copy button to ensure it's visible
             await page.locator(copy_button_selector).scroll_into_view_if_needed()
             
-            # Click the copy button
-            await page.click(copy_button_selector)
+            # Wait a bit more for any dynamic content to settle
+            await page.wait_for_timeout(1000)
+            
+            # Final popup cleanup before clicking
+            await self._handle_post_transcript_popups(page)
+            
+            # Ensure the copy button is clickable and not blocked
+            copy_button = page.locator(copy_button_selector)
+            
+            # Wait for the button to be in a clickable state
+            await copy_button.wait_for(state='visible', timeout=10000)
+            
+            # Wait for the button to be in a clickable state
+            await copy_button.wait_for(state='visible', timeout=10000)
+            
+            # Try multiple approaches to ensure button is clickable
+            clicked_successfully = False
+            
+            for attempt in range(3):
+                try:
+                    # Aggressive popup removal before each click attempt
+                    await page.evaluate("""
+                        () => {
+                            // Remove all potentially blocking elements
+                            const selectors = [
+                                '[class*="modal"]', '[class*="popup"]', '[class*="overlay"]',
+                                '[id*="modal"]', '[id*="popup"]', '[id*="overlay"]',
+                                '.banner', '.ad-banner', '.promotion', '.newsletter',
+                                '[style*="position: fixed"]', '[style*="z-index: 99"]'
+                            ];
+                            
+                            selectors.forEach(selector => {
+                                document.querySelectorAll(selector).forEach(el => {
+                                    if (el.id !== 'copy-transcript' && !el.contains(document.querySelector('#copy-transcript'))) {
+                                        el.style.display = 'none';
+                                        el.remove();
+                                    }
+                                });
+                            });
+                            
+                            // Ensure copy button is on top
+                            const button = document.querySelector('#copy-transcript');
+                            if (button) {
+                                button.style.position = 'relative';
+                                button.style.zIndex = '999999';
+                                button.style.pointerEvents = 'auto';
+                            }
+                        }
+                    """)
+                    
+                    # Check if button is visible and enabled
+                    if await copy_button.is_visible() and await copy_button.is_enabled():
+                        # Try normal click first
+                        await copy_button.click(timeout=3000)
+                        clicked_successfully = True
+                        break
+                except Exception as click_error:
+                    print(f"    ⚠️ Click attempt {attempt + 1} failed: {str(click_error)[:100]}")
+                    
+                    if attempt < 2:  # Not the last attempt
+                        # Handle popups again and wait
+                        await self._handle_post_transcript_popups(page)
+                        await page.wait_for_timeout(1500)
+                        
+                        # Try force click if normal click fails
+                        try:
+                            await copy_button.click(force=True, timeout=2000)
+                            clicked_successfully = True
+                            break
+                        except Exception as force_error:
+                            print(f"    ⚠️ Force click attempt {attempt + 1} also failed: {str(force_error)[:100]}")
+                            # Try JavaScript click as last resort
+                            try:
+                                await page.evaluate(f'document.querySelector("{copy_button_selector}").click()')
+                                clicked_successfully = True
+                                break
+                            except Exception as js_error:
+                                print(f"    ⚠️ JS click attempt {attempt + 1} failed: {str(js_error)[:100]}")
+                                continue
+                    else:
+                        # Last attempt - raise the error
+                        raise Exception(f"All click attempts failed. Last error: {str(click_error)}")
+            
+            if not clicked_successfully:
+                raise Exception("Failed to click copy button after all attempts")
             
             # Wait longer for clipboard operation to complete
             await page.wait_for_timeout(1500)
@@ -336,6 +425,95 @@ class WebTranscriptScraper:
         except:
             pass
 
+    async def _handle_post_transcript_popups(self, page):
+        """Handle popup banners that appear after transcript loading."""
+        popups_found = 0
+        try:
+            # Common popup banner selectors that might block interface
+            popup_selectors = [
+                # Generic modal/popup closers
+                'button[aria-label="Close"]',
+                'button.close',
+                '.modal-close',
+                '.popup-close',
+                '[data-dismiss="modal"]',
+                '.close-button',
+                
+                # Newsletter/subscription popups
+                'button:has-text("No thanks")',
+                'button:has-text("Skip")',
+                'button:has-text("Later")',
+                'button:has-text("Maybe later")',
+                'button:has-text("Not now")',
+                'button:has-text("Dismiss")',
+                '[aria-label="Close newsletter popup"]',
+                '[aria-label="Dismiss"]',
+                
+                # Advertisement/promotional banners
+                '.ad-banner .close',
+                '.promotion-banner .close',
+                '.banner-close',
+                'button:has-text("Continue without premium")',
+                'button:has-text("Continue for free")',
+                
+                # Generic overlay/banner removers
+                '.overlay .close',
+                '.banner-overlay .close',
+                '.popup-overlay .close',
+                
+                # Social media follow prompts
+                'button:has-text("Follow us")',
+                '.social-popup .close',
+                
+                # Survey/feedback popups
+                '.feedback-popup .close'
+            ]
+            
+            # Try to close any visible popups
+            for selector in popup_selectors:
+                try:
+                    # Check if element exists and is visible
+                    elements = await page.query_selector_all(selector)
+                    for element in elements:
+                        if await element.is_visible():
+                            await element.click(timeout=1000)
+                            popups_found += 1
+                            await page.wait_for_timeout(200)
+                            print(f"    📢 Closed popup with selector: {selector}")
+                except:
+                    continue
+            
+            # Additional approach: Remove common blocking overlays with CSS
+            await page.add_style_tag(content="""
+                /* Hide common popup/overlay patterns */
+                .modal, .popup, .overlay, .banner-overlay, 
+                .newsletter-popup, .social-popup, .ad-banner,
+                .promotion-modal, .subscription-popup, .premium-popup,
+                [class*="popup"], [class*="modal"], [class*="overlay"],
+                [id*="popup"], [id*="modal"], [id*="overlay"],
+                [data-testid*="popup"], [data-testid*="modal"],
+                div[style*="position: fixed"], div[style*="z-index: 999"] {
+                    display: none !important;
+                    visibility: hidden !important;
+                    opacity: 0 !important;
+                    pointer-events: none !important;
+                }
+                
+                /* Ensure copy button is always clickable */
+                #copy-transcript {
+                    position: relative !important;
+                    z-index: 9999 !important;
+                    pointer-events: auto !important;
+                }
+            """)
+            
+            if popups_found > 0:
+                print(f"    🎯 Successfully handled {popups_found} popup(s)")
+            
+        except Exception as e:
+            print(f"    ⚠️ Error handling popups: {str(e)[:100]}")
+            pass
+
     def _clean_text(self, text: str) -> str:
         """Basic text cleaning."""
         text = re.sub(r'^\d{1,2}:\d{2}\s', '', text, flags=re.MULTILINE)
@@ -373,9 +551,6 @@ if __name__ == "__main__":
         "https://www.youtube.com/watch?v=Q57_iaGrxLg&list=PL0vfts4VzfNjS8-DG68UDBZyeVkND3AXt&index=1&pp=iAQB",  
         "https://www.youtube.com/watch?v=ozkg_iW9mNU&list=PL0vfts4VzfNjS8-DG68UDBZyeVkND3AXt&index=2&pp=iAQB",  
         "https://www.youtube.com/watch?v=7rXgVsIGvGQ&list=PL0vfts4VzfNjS8-DG68UDBZyeVkND3AXt&index=3&pp=iAQB",
-        "https://www.youtube.com/watch?v=ek2yOqAIYuU&list=PL0vfts4VzfNjS8-DG68UDBZyeVkND3AXt&index=4&pp=iAQB",
-        "https://www.youtube.com/watch?v=TsKHjFeonRE&list=PL0vfts4VzfNjS8-DG68UDBZyeVkND3AXt&index=5&pp=iAQB",
-        "https://www.youtube.com/watch?v=wbQwD3QS19I&list=PL0vfts4VzfNjS8-DG68UDBZyeVkND3AXt&index=6&pp=iAQB0gcJCesJAYcqIYzv"  
     ]
     
     print(f"Testing concurrent processing with {len(playlist_urls)} videos...")
