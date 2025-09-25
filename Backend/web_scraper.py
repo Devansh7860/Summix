@@ -38,7 +38,7 @@ class WebTranscriptScraper:
         
         try:
             future = self._executor.submit(self._run_async_isolated, video_url)
-            result = future.result(timeout=120)  # 120 second timeout
+            result = future.result(timeout=240)  # 240 second timeout
             return result
         except Exception as e:
             print(f"⚠️  Web scraping failed: {e}")
