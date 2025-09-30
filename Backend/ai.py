@@ -119,7 +119,27 @@ Now summarize the following transcript:
 
 # Task tracking
 active_tasks = {}
+task_timestamps = {}  # Track when tasks were started
 task_lock = threading.Lock()
+TASK_TIMEOUT = 1800  # 30 minutes timeout for abandoned tasks
+
+def cleanup_abandoned_tasks():
+    """Clean up tasks that have been running for too long"""
+    import time
+    current_time = time.time()
+    
+    with task_lock:
+        tasks_to_remove = []
+        for task_key, start_time in task_timestamps.items():
+            if current_time - start_time > TASK_TIMEOUT:
+                print(f"🧹 Cleaning up abandoned task: {task_key} (running for {(current_time - start_time)/60:.1f} minutes)")
+                tasks_to_remove.append(task_key)
+        
+        for task_key in tasks_to_remove:
+            if task_key in active_tasks:
+                del active_tasks[task_key]
+            if task_key in task_timestamps:
+                del task_timestamps[task_key]
 
 def cancel_task(userId, contentId, is_playlist=False):
     """Cancel an active task for a user"""
@@ -128,12 +148,18 @@ def cancel_task(userId, contentId, is_playlist=False):
     with task_lock:
         if task_key in active_tasks:
             active_tasks[task_key] = False
+            # Remove timestamp since task is being cancelled
+            if task_key in task_timestamps:
+                del task_timestamps[task_key]
             print(f"Cancellation requested for task: {task_key}")
             return True
         return False
 
 def is_task_cancelled(userId, contentId, is_playlist=False):
     """Check if a task has been cancelled"""
+    # First clean up any abandoned tasks
+    cleanup_abandoned_tasks()
+    
     task_key = f"{userId}_{contentId}_{is_playlist}"
     
     with task_lock:
@@ -142,11 +168,27 @@ def is_task_cancelled(userId, contentId, is_playlist=False):
 
 def register_task(userId, contentId, is_playlist=False):
     """Register a new active task"""
+    import time
     task_key = f"{userId}_{contentId}_{is_playlist}"
     
     with task_lock:
+        # Clean up old tasks before registering new one
+        cleanup_abandoned_tasks()
+        
         active_tasks[task_key] = True
+        task_timestamps[task_key] = time.time()
         print(f"Registered new task: {task_key}")
+
+def unregister_task(userId, contentId, is_playlist=False):
+    """Unregister a completed task"""
+    task_key = f"{userId}_{contentId}_{is_playlist}"
+    
+    with task_lock:
+        if task_key in active_tasks:
+            del active_tasks[task_key]
+        if task_key in task_timestamps:
+            del task_timestamps[task_key]
+        print(f"Unregistered task: {task_key}")
 
 def unregister_task(userId, contentId, is_playlist=False):
     """Remove a task from tracking"""
@@ -450,6 +492,11 @@ async def streaming_playlist_pipeline(playlist_id, userId, api_key, max_concurre
     """
     print(f"🚀 Starting hybrid streaming pipeline for playlist {playlist_id}")
     
+    # Check cancellation at the very start
+    if is_task_cancelled(userId, playlist_id, is_playlist=True):
+        print(f"Task cancelled before starting playlist {playlist_id}")
+        return "Task was cancelled"
+    
     # STAGE 1: Use optimized batch transcript fetching (already concurrent & optimized)
     try:
         playlist = Playlist(f"https://www.youtube.com/playlist?list={playlist_id}")
@@ -461,6 +508,12 @@ async def streaming_playlist_pipeline(playlist_id, userId, api_key, max_concurre
             return None
             
         print(f"📋 Found {total_videos} videos in playlist")
+        
+        # Check cancellation after getting video list
+        if is_task_cancelled(userId, playlist_id, is_playlist=True):
+            print(f"Task cancelled after getting video list for playlist {playlist_id}")
+            return "Task was cancelled"
+            
         print(f"🔄 Stage 1: Fetching all transcripts using optimized batch method...")
         
         # Use the existing optimized batch fetching
@@ -475,9 +528,19 @@ async def streaming_playlist_pipeline(playlist_id, userId, api_key, max_concurre
         
         transcript_results = await asyncio.to_thread(_fetch_transcripts_batch)
         
+        # Check cancellation after transcript fetching
+        if is_task_cancelled(userId, playlist_id, is_playlist=True):
+            print(f"Task cancelled after transcript fetching for playlist {playlist_id}")
+            return "Task was cancelled"
+        
         # Convert results to VideoData objects with transcripts
         video_data_list = []
         for video_url, transcript in transcript_results.items():
+            # Check cancellation during video processing
+            if is_task_cancelled(userId, playlist_id, is_playlist=True):
+                print(f"Task cancelled during video data processing for playlist {playlist_id}")
+                return "Task was cancelled"
+                
             video_id = video_url.split("v=")[1].split("&")[0] if "v=" in video_url else video_url.split("/")[-1]
             video_data = VideoData(video_id, playlist_id, userId, api_key)
             
@@ -495,6 +558,11 @@ async def streaming_playlist_pipeline(playlist_id, userId, api_key, max_concurre
     except Exception as e:
         print(f"❌ Error in batch transcript fetching: {e}")
         return None
+    
+    # Check cancellation before starting Stage 2
+    if is_task_cancelled(userId, playlist_id, is_playlist=True):
+        print(f"Task cancelled before Stage 2 for playlist {playlist_id}")
+        return "Task was cancelled"
     
     # STAGE 2: Streaming processing pipeline (translate → summarize → collect)
     print(f"🔄 Stage 2: Starting streaming processing pipeline...")
