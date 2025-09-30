@@ -66,12 +66,20 @@ def translate_hindi_to_english(hindi_text, api_key):
     print("Translation complete.")
     return english_translation
 
-def fetch_transcript(video_id, api_key):
+def fetch_transcript(video_id, api_key, browserless_api_key=None):
     print(f"Fetching transcript for video ID: {video_id}")
     try:
+        # Create a TranscriptFetcher instance with the provided Browserless API key
+        if browserless_api_key:
+            temp_fetcher = TranscriptFetcher(rate_limit_delay=3, browserless_api_key=browserless_api_key)
+            transcript_func = temp_fetcher.get_transcript
+        else:
+            # Use the global fetcher as fallback
+            transcript_func = get_transcript
+            
         video_url = f"https://www.youtube.com/watch?v={video_id}"
         print("Using get_transcript to fetch the transcript...")
-        transcript = get_transcript(video_url)
+        transcript = transcript_func(video_url)
         
         if not transcript:
             print("No transcript available for this video.")
@@ -150,7 +158,7 @@ def unregister_task(userId, contentId, is_playlist=False):
             print(f"Unregistered task: {task_key}")
 
 # main function to summarize video
-def summarize(video_id, userId, api_key):
+def summarize(video_id, userId, api_key, browserless_api_key=None):
     print(f"Starting summarization for video: {video_id}, user: {userId}")
     
     # Register this task
@@ -164,7 +172,7 @@ def summarize(video_id, userId, api_key):
             unregister_task(userId, video_id)
             return cached_summary
 
-        transcript = fetch_transcript(video_id, api_key)
+        transcript = fetch_transcript(video_id, api_key, browserless_api_key)
         if not transcript:
             unregister_task(userId, video_id)
             print("No transcript available, cannot generate summary")
@@ -434,7 +442,7 @@ Transcript: {context}""",
         await output_queue.put(video_data)
         input_queue.task_done()
 
-async def streaming_playlist_pipeline(playlist_id, userId, api_key, max_concurrent=3):
+async def streaming_playlist_pipeline(playlist_id, userId, api_key, max_concurrent=3, browserless_api_key=None):
     """
     Hybrid streaming pipeline that uses optimized batch fetching + streaming processing
     Stage 1: Optimized concurrent transcript fetching (batch)  
@@ -457,7 +465,13 @@ async def streaming_playlist_pipeline(playlist_id, userId, api_key, max_concurre
         
         # Use the existing optimized batch fetching
         def _fetch_transcripts_batch():
-            return fetcher.get_playlist_transcripts(video_urls)
+            # Create a TranscriptFetcher instance with the provided Browserless API key
+            if browserless_api_key:
+                temp_fetcher = TranscriptFetcher(rate_limit_delay=3, browserless_api_key=browserless_api_key)
+                return temp_fetcher.get_playlist_transcripts(video_urls)
+            else:
+                # Use the global fetcher as fallback
+                return fetcher.get_playlist_transcripts(video_urls)
         
         transcript_results = await asyncio.to_thread(_fetch_transcripts_batch)
         
@@ -597,7 +611,7 @@ summaries: {combined_summaries}""",
     
     return final_summary
 
-async def summarizePlaylist(playlist_id, userId, api_key):
+async def summarizePlaylist(playlist_id, userId, api_key, browserless_api_key=None):
     """
     Streaming playlist summarizer that processes videos through concurrent pipeline stages
     Each video flows through: fetch → translate → summarize → collect
@@ -623,7 +637,7 @@ async def summarizePlaylist(playlist_id, userId, api_key):
         
         # Run streaming pipeline
         print("🔄 Starting streaming pipeline...")
-        completed_videos = await streaming_playlist_pipeline(playlist_id, userId, api_key, max_concurrent=3)
+        completed_videos = await streaming_playlist_pipeline(playlist_id, userId, api_key, max_concurrent=3, browserless_api_key=browserless_api_key)
         
         # Check for cancellation after pipeline
         if is_task_cancelled(userId, playlist_id, is_playlist=True):

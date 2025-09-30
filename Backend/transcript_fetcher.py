@@ -19,13 +19,14 @@ from utils import extract_video_id, clean_transcript_text
 
 
 class TranscriptFetcher:
-    def __init__(self, rate_limit_delay=2):
+    def __init__(self, rate_limit_delay=2, browserless_api_key: Optional[str] = None):
         """
         Initialize the transcript fetcher with multiple backend methods.
         Uses centralized vector storage for caching.
         
         Args:
             rate_limit_delay: Minimum delay between requests (in seconds)
+            browserless_api_key: Optional Browserless API key for web scraping
         """
         self.rate_limit_delay = rate_limit_delay
         self.last_request_time = 0
@@ -33,7 +34,7 @@ class TranscriptFetcher:
         # Initialize different fetchers
         self.api_fetcher = APITranscriptFetcher()
         # self.ytdlp_fetcher = YtDlpTranscriptFetcher()
-        self.web_scraper = WebTranscriptScraper()
+        self.web_scraper = WebTranscriptScraper(browserless_api_key=browserless_api_key)
         
         # Initialize vector store for centralized caching
         self._init_vector_store()
