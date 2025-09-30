@@ -1,3 +1,5 @@
 #!/usr/bin/env bash
-echo "-----> Installing Playwright browsers"
-python -m playwright install chromium
+echo "-----> Installing Playwright system dependencies"
+playwright install-deps chromium
+echo "-----> Installing Playwright Chromium browser"
+playwright install chromium
