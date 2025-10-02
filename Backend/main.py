@@ -1,10 +1,114 @@
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from typing import Optional
+import asyncio
+import json
 load_dotenv()
-from ai import summarize, ask, summarizePlaylist, cancel_task
+from ai import summarize, ask, summarizePlaylist
+from websocket_task_manager import task_manager, TaskType, TaskStatus, periodic_cleanup
+
+# Background task functions
+async def summarize_background(video_id: str, user_id: str, api_key: str, browserless_api_key: str, task_id: str):
+    """Background task for video summarization"""
+    try:
+        print(f"🚀 Starting background summarization for video {video_id}, task {task_id}")
+        
+        # Run the summarization
+        result = await summarize(video_id, user_id, api_key, browserless_api_key, task_id)
+        
+        # Check if task was cancelled during processing
+        task_status = await task_manager.get_task_status(task_id)
+        if task_status == TaskStatus.CANCELLED:
+            print(f"❌ Task {task_id} was cancelled - not sending result")
+            return
+        
+        # Send final result via WebSocket
+        if result and result != "Task was cancelled":
+            await task_manager.update_task(
+                task_id, 
+                status=TaskStatus.COMPLETED, 
+                progress=100, 
+                message="Summary completed", 
+                result=result
+            )
+            print(f"✅ Background summarization completed for task {task_id}")
+        else:
+            await task_manager.update_task(
+                task_id, 
+                status=TaskStatus.FAILED, 
+                progress=100, 
+                message="Summarization failed",
+                error="Failed to generate summary"
+            )
+            print(f"❌ Background summarization failed for task {task_id}")
+            
+    except Exception as e:
+        print(f"💥 Background summarization error for task {task_id}: {str(e)}")
+        # Only update if task wasn't cancelled
+        try:
+            task_status = await task_manager.get_task_status(task_id)
+            if task_status != TaskStatus.CANCELLED:
+                await task_manager.update_task(
+                    task_id, 
+                    status=TaskStatus.FAILED, 
+                    progress=100, 
+                    message="Summarization error",
+                    error=str(e)
+                )
+        except:
+            pass  # Task might not exist anymore
+
+async def summarize_playlist_background(playlist_id: str, user_id: str, api_key: str, browserless_api_key: str, task_id: str):
+    """Background task for playlist summarization"""
+    try:
+        print(f"🚀 Starting background playlist summarization for {playlist_id}, task {task_id}")
+        
+        # Run the playlist summarization
+        result = await summarizePlaylist(playlist_id, user_id, api_key, browserless_api_key, task_id)
+        
+        # Check if task was cancelled during processing
+        task_status = await task_manager.get_task_status(task_id)
+        if task_status == TaskStatus.CANCELLED:
+            print(f"❌ Task {task_id} was cancelled - not sending result")
+            return
+        
+        # Send final result via WebSocket
+        if result and result != "Task was cancelled":
+            await task_manager.update_task(
+                task_id, 
+                status=TaskStatus.COMPLETED, 
+                progress=100, 
+                message="Playlist summary completed", 
+                result=result
+            )
+            print(f"✅ Background playlist summarization completed for task {task_id}")
+        else:
+            await task_manager.update_task(
+                task_id, 
+                status=TaskStatus.FAILED, 
+                progress=100, 
+                message="Playlist summarization failed",
+                error="Failed to generate playlist summary"
+            )
+            print(f"❌ Background playlist summarization failed for task {task_id}")
+            
+    except Exception as e:
+        print(f"💥 Background playlist summarization error for task {task_id}: {str(e)}")
+        # Only update if task wasn't cancelled
+        try:
+            task_status = await task_manager.get_task_status(task_id)
+            if task_status != TaskStatus.CANCELLED:
+                await task_manager.update_task(
+                    task_id, 
+                    status=TaskStatus.FAILED, 
+                    progress=100, 
+                    message="Playlist summarization error",
+                    error=str(e)
+                )
+        except:
+            pass  # Task might not exist anymore
 
 
 
@@ -17,6 +121,29 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Start periodic cleanup task
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(periodic_cleanup())
+
+# WebSocket endpoint for real-time task management
+@app.websocket("/ws/{user_id}")
+async def websocket_endpoint(websocket: WebSocket, user_id: str):
+    await task_manager.connect_user(websocket, user_id)
+    try:
+        while True:
+            # Keep connection alive and handle any incoming messages
+            data = await websocket.receive_text()
+            try:
+                message = json.loads(data)
+                # Handle client messages if needed (ping/pong, etc.)
+                if message.get("type") == "ping":
+                    await websocket.send_text(json.dumps({"type": "pong"}))
+            except json.JSONDecodeError:
+                pass
+    except WebSocketDisconnect:
+        await task_manager.disconnect_user(user_id)
 
 
 
@@ -301,9 +428,14 @@ async def summarize_video(data: Video, request: Request):
     # Use token validation if available, otherwise quick validation
     await validate_with_token_or_quick(api_key, browserless_api_key, validation_token)
     
-    # Keys validated, proceed with summarization
-    res = summarize(data.video_id, data.userId, api_key, browserless_api_key)
-    return {"summary": res}
+    # Create task in WebSocket manager
+    task_id = await task_manager.create_task(data.userId, TaskType.VIDEO_SUMMARY, data.video_id)
+    
+    # Start summarization in background (non-blocking)
+    asyncio.create_task(summarize_background(data.video_id, data.userId, api_key, browserless_api_key, task_id))
+    
+    # Return immediately with task info
+    return {"task_id": task_id, "status": "started", "message": "Summarization started"}
 
 @app.post("/ask")
 async def askQuestion(data: Question, request: Request):
@@ -316,7 +448,8 @@ async def askQuestion(data: Question, request: Request):
     await validate_with_token_or_quick(api_key, browserless_api_key, validation_token)
     
     # Keys validated, proceed with question answering
-    res = ask(data.video_id, data.playlist_id, data.question, data.userId, api_key)
+    import asyncio
+    res = await asyncio.to_thread(ask, data.video_id, data.playlist_id, data.question, data.userId, api_key)
     return {"answer": res}
 
 @app.post("/summarize/playlist")
@@ -329,24 +462,34 @@ async def summarize_playlist(data: Playlist, request: Request):
     # Use token validation if available, otherwise quick validation
     await validate_with_token_or_quick(api_key, browserless_api_key, validation_token)
     
-    # Keys validated, proceed with playlist summarization
-    res = await summarizePlaylist(data.playlist_id, data.userId, api_key, browserless_api_key)
-    return {"summary": res}
+    # Create task in WebSocket manager
+    task_id = await task_manager.create_task(data.userId, TaskType.PLAYLIST_SUMMARY, data.playlist_id)
+    
+    # Start playlist summarization in background (non-blocking)
+    asyncio.create_task(summarize_playlist_background(data.playlist_id, data.userId, api_key, browserless_api_key, task_id))
+    
+    # Return immediately with task info
+    return {"task_id": task_id, "status": "started", "message": "Playlist summarization started"}
 
 @app.post("/cancel")
 async def cancel_processing(data: CancelRequest, request: Request):
     """Cancel ongoing summarization tasks for a specific user/content"""
-    # Cancel requests don't need API key since they don't make LLM calls
-    if data.videoId:
-        success = cancel_task(data.userId, data.videoId)
-    elif data.playlistId:
-        success = cancel_task(data.userId, data.playlistId, is_playlist=True)
-    else:
-        success = False
+    success_count = 0
     
-    return {"success": success, "message": "Cancellation request received"}
+    if data.videoId:
+        success_count = await task_manager.cancel_user_tasks(data.userId, data.videoId)
+    elif data.playlistId:
+        success_count = await task_manager.cancel_user_tasks(data.userId, data.playlistId)
+    else:
+        success_count = await task_manager.cancel_user_tasks(data.userId)
+    
+    return {"success": success_count > 0, "cancelled_tasks": success_count, "message": "Cancellation request processed"}
 
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
 

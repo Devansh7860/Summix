@@ -15,6 +15,7 @@ import asyncio
 import threading
 
 from transcript_fetcher import TranscriptFetcher
+from websocket_task_manager import task_manager, TaskStatus
 
 # Initialize transcript fetcher with centralized caching
 fetcher = TranscriptFetcher(rate_limit_delay=3)
@@ -66,8 +67,20 @@ def translate_hindi_to_english(hindi_text, api_key):
     print("Translation complete.")
     return english_translation
 
-def fetch_transcript(video_id, api_key, browserless_api_key=None):
+def fetch_transcript(video_id, api_key, browserless_api_key=None, userId=None, task_id=None):
     print(f"Fetching transcript for video ID: {video_id}")
+    
+    # Check cancellation before starting
+    if userId and task_id:
+        try:
+            task_status = task_manager.get_task_status_sync(task_id)
+            if task_status == TaskStatus.CANCELLED:
+                print(f"Task cancelled before transcript fetch: {video_id}")
+                return None
+        except:
+            # If task doesn't exist, continue processing
+            pass
+        
     try:
         # Create a TranscriptFetcher instance with the provided Browserless API key
         if browserless_api_key:
@@ -81,6 +94,16 @@ def fetch_transcript(video_id, api_key, browserless_api_key=None):
         print("Using get_transcript to fetch the transcript...")
         transcript = transcript_func(video_url)
         
+        # Check cancellation after transcript fetch
+        if userId and task_id:
+            try:
+                task_status = task_manager.get_task_status_sync(task_id)
+                if task_status == TaskStatus.CANCELLED:
+                    print(f"Task cancelled after transcript fetch: {video_id}")
+                    return None
+            except:
+                pass
+        
         if not transcript:
             print("No transcript available for this video.")
             return None
@@ -89,7 +112,29 @@ def fetch_transcript(video_id, api_key, browserless_api_key=None):
         hindi_chars = set('अआइईउऊऋएऐओऔकखगघचछजझटठडढणतथदधनपफबभमयरलवशषसह')
         if any(char in hindi_chars for char in transcript[:1000]):
             print("Hindi transcript detected, translating...")
+            
+            # Check cancellation before translation
+            if userId and task_id:
+                try:
+                    task_status = task_manager.get_task_status_sync(task_id)
+                    if task_status == TaskStatus.CANCELLED:
+                        print(f"Task cancelled before Hindi translation: {video_id}")
+                        return None
+                except:
+                    pass
+                
             english_transcript = translate_hindi_to_english(transcript, api_key)
+            
+            # Check cancellation after translation
+            if userId and task_id:
+                try:
+                    task_status = task_manager.get_task_status_sync(task_id)
+                    if task_status == TaskStatus.CANCELLED:
+                        print(f"Task cancelled after Hindi translation: {video_id}")
+                        return None
+                except:
+                    pass
+                
             print("Translation successful!")
             return english_transcript
         
@@ -117,135 +162,151 @@ Now summarize the following transcript:
     input_variables=["context"]
 )
 
-# Task tracking
-active_tasks = {}
-task_timestamps = {}  # Track when tasks were started
-task_lock = threading.Lock()
-TASK_TIMEOUT = 1800  # 30 minutes timeout for abandoned tasks
-
-def cleanup_abandoned_tasks():
-    """Clean up tasks that have been running for too long"""
-    import time
-    current_time = time.time()
+# main function to summarize video with WebSocket task management
+async def summarize(video_id, userId, api_key, browserless_api_key=None, task_id=None):
+    print(f"Starting summarization for video: {video_id}, user: {userId}, task: {task_id}")
     
-    with task_lock:
-        tasks_to_remove = []
-        for task_key, start_time in task_timestamps.items():
-            if current_time - start_time > TASK_TIMEOUT:
-                print(f"🧹 Cleaning up abandoned task: {task_key} (running for {(current_time - start_time)/60:.1f} minutes)")
-                tasks_to_remove.append(task_key)
-        
-        for task_key in tasks_to_remove:
-            if task_key in active_tasks:
-                del active_tasks[task_key]
-            if task_key in task_timestamps:
-                del task_timestamps[task_key]
-
-def cancel_task(userId, contentId, is_playlist=False):
-    """Cancel an active task for a user"""
-    task_key = f"{userId}_{contentId}_{is_playlist}"
-    
-    with task_lock:
-        if task_key in active_tasks:
-            active_tasks[task_key] = False
-            # Remove timestamp since task is being cancelled
-            if task_key in task_timestamps:
-                del task_timestamps[task_key]
-            print(f"Cancellation requested for task: {task_key}")
-            return True
-        return False
-
-def is_task_cancelled(userId, contentId, is_playlist=False):
-    """Check if a task has been cancelled"""
-    # First clean up any abandoned tasks
-    cleanup_abandoned_tasks()
-    
-    task_key = f"{userId}_{contentId}_{is_playlist}"
-    
-    with task_lock:
-        # If task isn't being tracked or is marked False, it's cancelled
-        return task_key not in active_tasks or not active_tasks[task_key]
-
-def register_task(userId, contentId, is_playlist=False):
-    """Register a new active task"""
-    import time
-    task_key = f"{userId}_{contentId}_{is_playlist}"
-    
-    with task_lock:
-        # Clean up old tasks before registering new one
-        cleanup_abandoned_tasks()
-        
-        active_tasks[task_key] = True
-        task_timestamps[task_key] = time.time()
-        print(f"Registered new task: {task_key}")
-
-def unregister_task(userId, contentId, is_playlist=False):
-    """Unregister a completed task"""
-    task_key = f"{userId}_{contentId}_{is_playlist}"
-    
-    with task_lock:
-        if task_key in active_tasks:
-            del active_tasks[task_key]
-        if task_key in task_timestamps:
-            del task_timestamps[task_key]
-        print(f"Unregistered task: {task_key}")
-
-def unregister_task(userId, contentId, is_playlist=False):
-    """Remove a task from tracking"""
-    task_key = f"{userId}_{contentId}_{is_playlist}"
-    
-    with task_lock:
-        if task_key in active_tasks:
-            del active_tasks[task_key]
-            print(f"Unregistered task: {task_key}")
-
-# main function to summarize video
-def summarize(video_id, userId, api_key, browserless_api_key=None):
-    print(f"Starting summarization for video: {video_id}, user: {userId}")
-    
-    # Register this task
-    register_task(userId, video_id)
+    # Update task status to running
+    if task_id:
+        await task_manager.update_task(task_id, status=TaskStatus.RUNNING, progress=5, message="Starting video summarization")
     
     try:
         # Check if summary already exists in centralized vector store
         cached_summary = fetcher._get_cached_summary_from_vector_store(video_id=video_id)
         if cached_summary:
             print("📦 Found cached summary in centralized vector store")
-            unregister_task(userId, video_id)
+            # Return cached summary (background task will handle WebSocket update)
             return cached_summary
 
-        transcript = fetch_transcript(video_id, api_key, browserless_api_key)
+        # Update progress
+        if task_id:
+            await task_manager.update_task(task_id, progress=10, message="Fetching video transcript")
+        
+        # Call fetch_transcript in a thread since it's not async
+        import asyncio
+        transcript = await asyncio.to_thread(fetch_transcript, video_id, api_key, browserless_api_key, userId, task_id)
         if not transcript:
-            unregister_task(userId, video_id)
+            # Check if task was cancelled first - if so, don't send error message
+            if task_id:
+                task_status = await task_manager.get_task_status(task_id)
+                if task_status == TaskStatus.CANCELLED:
+                    print(f"Task cancelled during transcript fetch: {video_id}")
+                    return "Task was cancelled"
+            
+            # Task wasn't cancelled, so it's a real transcript error
+            if task_id:
+                await task_manager.update_task(task_id, status=TaskStatus.FAILED, progress=100, 
+                                             message="No transcript available", error="No transcript available for this video.")
             print("No transcript available, cannot generate summary")
             return "No transcript available for this video."
 
-        # Check for cancellation after expensive operation
-        if is_task_cancelled(userId, video_id):
-            print(f"Task cancelled: summarize video {video_id} for user {userId}")
-            return "Task was cancelled"
+        # Check for cancellation after transcript
+        if task_id:
+            task_status = await task_manager.get_task_status(task_id)
+            if task_status == TaskStatus.CANCELLED:
+                print(f"Task cancelled after transcript fetch: {video_id}")
+                return "Task was cancelled"
+
+        # Update progress
+        if task_id:
+            await task_manager.update_task(task_id, progress=30, message="Generating AI summary")
 
         print("Generating summary...")
         model = create_model(api_key)
+        
+        # Small delay to allow cancellation requests to arrive
+        import time
+        time.sleep(0.1)  # 100ms delay
+        
+        # Check cancellation before AI processing
+        if task_id:
+            task_status = await task_manager.get_task_status(task_id)
+            if task_status == TaskStatus.CANCELLED:
+                print(f"Task cancelled before AI processing: {video_id}")
+                return "Task was cancelled"
+        
         chain = prompt | model | parser
-        summary = chain.invoke({"context": transcript})
+        
+        # For long AI processing, we'll use threading with periodic checks
+        import threading
+        import time
+        
+        summary_result = {"value": None, "error": None, "cancelled": False}
+        
+        def ai_worker():
+            try:
+                # Check for cancellation RIGHT before starting AI processing
+                if task_id:
+                    task_status = task_manager.get_task_status_sync(task_id)
+                    if task_status == TaskStatus.CANCELLED:
+                        print(f"Task cancelled before starting AI chain: {video_id}")
+                        summary_result["cancelled"] = True
+                        return
+                    
+                summary_result["value"] = chain.invoke({"context": transcript})
+            except Exception as e:
+                summary_result["error"] = str(e)
+        
+        # Start AI processing in background thread
+        ai_thread = threading.Thread(target=ai_worker)
+        ai_thread.start()
+        
+        # Wait with periodic cancellation checks (every 50ms for good balance)
+        while ai_thread.is_alive():
+            ai_thread.join(timeout=0.05)  # Wait max 50ms for good balance
+            
+            # Check for cancellation every 50ms
+            if task_id:
+                task_status = task_manager.get_task_status_sync(task_id)
+                if task_status == TaskStatus.CANCELLED:
+                    print(f"Task cancelled during AI processing: {video_id}")
+                    summary_result["cancelled"] = True
+                    # Thread will finish naturally, we just won't use the result
+                    break
+        
+        # Wait for thread to finish if not cancelled
+        if not summary_result["cancelled"]:
+            ai_thread.join()
+
+        # Handle results
+        if summary_result["cancelled"] or (task_id and task_manager.get_task_status_sync(task_id) == TaskStatus.CANCELLED):
+            print(f"Task was cancelled during or after AI processing: {video_id}")
+            # Don't send WebSocket messages for cancelled tasks to avoid showing messages for old content
+            # if task_id:
+            #     await task_manager.update_task(task_id, status=TaskStatus.CANCELLED, progress=100, message="Task was cancelled")
+            return "Task was cancelled"
+            
+        if summary_result["error"]:
+            if task_id:
+                await task_manager.update_task(task_id, status=TaskStatus.FAILED, progress=100, 
+                                             message="AI processing failed", error=str(summary_result["error"]))
+            raise Exception(summary_result["error"])
+            
+        summary = summary_result["value"]
         print("Summary generated successfully!")
         
         # Check for cancellation again
-        if is_task_cancelled(userId, video_id):
-            print(f"Task cancelled after summary generation: {video_id}")
-            return "Task was cancelled"
+        if task_id:
+            task_status = await task_manager.get_task_status(task_id)
+            if task_status == TaskStatus.CANCELLED:
+                print(f"Task cancelled after summary generation: {video_id}")
+                return "Task was cancelled"
+        
+        # Update progress
+        if task_id:
+            await task_manager.update_task(task_id, progress=90, message="Caching summary")
             
         # Cache summary to centralized vector store
         print("💾 Caching summary to centralized vector store...")
         fetcher._cache_summary_to_vector_store(summary, video_id=video_id)
         
-        # Unregister completed task
-        unregister_task(userId, video_id)
+        # Return summary (background task will handle WebSocket update)
         return summary
     except Exception as e:
-        # Make sure to unregister on error
-        unregister_task(userId, video_id)
+        # Make sure to update task status on error
+        if task_id:
+            await task_manager.update_task(task_id, status=TaskStatus.FAILED, progress=100, 
+                                         message="Summarization failed", error=str(e))
         print(f"Error in summarize: {e}")
         raise e
 
@@ -365,7 +426,7 @@ class VideoData:
         self.error = None
         self.cached = False
 
-async def translate_stage_worker(input_queue, output_queue, userId, playlist_id, api_key):
+async def translate_stage_worker(input_queue, output_queue, userId, playlist_id, api_key, task_id=None):
     """Worker for translating transcripts (if needed)"""
     while True:
         video_data = await input_queue.get()
@@ -375,11 +436,13 @@ async def translate_stage_worker(input_queue, output_queue, userId, playlist_id,
             
         try:
             # Check cancellation before processing
-            if is_task_cancelled(userId, playlist_id, is_playlist=True):
-                video_data.error = "Task cancelled during translation"
-                await output_queue.put(video_data)
-                input_queue.task_done()
-                continue
+            if task_id:
+                task_status = task_manager.get_task_status_sync(task_id)
+                if task_status == TaskStatus.CANCELLED:
+                    video_data.error = "Task cancelled during translation"
+                    await output_queue.put(video_data)
+                    input_queue.task_done()
+                    continue
                 
             # Skip if there's an error from previous stage
             if video_data.error:
@@ -413,7 +476,7 @@ async def translate_stage_worker(input_queue, output_queue, userId, playlist_id,
         await output_queue.put(video_data)
         input_queue.task_done()
 
-async def summarize_stage_worker(input_queue, output_queue, userId, playlist_id, api_key):
+async def summarize_stage_worker(input_queue, output_queue, userId, playlist_id, api_key, task_id=None):
     """Worker for generating summaries"""
     while True:
         video_data = await input_queue.get()
@@ -423,11 +486,13 @@ async def summarize_stage_worker(input_queue, output_queue, userId, playlist_id,
             
         try:
             # Check cancellation before processing
-            if is_task_cancelled(userId, playlist_id, is_playlist=True):
-                video_data.error = "Task cancelled during summarization"
-                await output_queue.put(video_data)
-                input_queue.task_done()
-                continue
+            if task_id:
+                task_status = task_manager.get_task_status_sync(task_id)
+                if task_status == TaskStatus.CANCELLED:
+                    video_data.error = "Task cancelled during summarization"
+                    await output_queue.put(video_data)
+                    input_queue.task_done()
+                    continue
                 
             # Skip if there's an error from previous stage
             if video_data.error:
@@ -484,7 +549,7 @@ Transcript: {context}""",
         await output_queue.put(video_data)
         input_queue.task_done()
 
-async def streaming_playlist_pipeline(playlist_id, userId, api_key, max_concurrent=3, browserless_api_key=None):
+async def streaming_playlist_pipeline(playlist_id, userId, api_key, max_concurrent=3, browserless_api_key=None, task_id=None):
     """
     Hybrid streaming pipeline that uses optimized batch fetching + streaming processing
     Stage 1: Optimized concurrent transcript fetching (batch)  
@@ -493,9 +558,11 @@ async def streaming_playlist_pipeline(playlist_id, userId, api_key, max_concurre
     print(f"🚀 Starting hybrid streaming pipeline for playlist {playlist_id}")
     
     # Check cancellation at the very start
-    if is_task_cancelled(userId, playlist_id, is_playlist=True):
-        print(f"Task cancelled before starting playlist {playlist_id}")
-        return "Task was cancelled"
+    if task_id:
+        task_status = await task_manager.get_task_status(task_id)
+        if task_status == TaskStatus.CANCELLED:
+            print(f"Task cancelled before starting playlist {playlist_id}")
+            return "Task was cancelled"
     
     # STAGE 1: Use optimized batch transcript fetching (already concurrent & optimized)
     try:
@@ -510,9 +577,11 @@ async def streaming_playlist_pipeline(playlist_id, userId, api_key, max_concurre
         print(f"📋 Found {total_videos} videos in playlist")
         
         # Check cancellation after getting video list
-        if is_task_cancelled(userId, playlist_id, is_playlist=True):
-            print(f"Task cancelled after getting video list for playlist {playlist_id}")
-            return "Task was cancelled"
+        if task_id:
+            task_status = await task_manager.get_task_status(task_id)
+            if task_status == TaskStatus.CANCELLED:
+                print(f"Task cancelled after getting video list for playlist {playlist_id}")
+                return "Task was cancelled"
             
         print(f"🔄 Stage 1: Fetching all transcripts using optimized batch method...")
         
@@ -529,17 +598,21 @@ async def streaming_playlist_pipeline(playlist_id, userId, api_key, max_concurre
         transcript_results = await asyncio.to_thread(_fetch_transcripts_batch)
         
         # Check cancellation after transcript fetching
-        if is_task_cancelled(userId, playlist_id, is_playlist=True):
-            print(f"Task cancelled after transcript fetching for playlist {playlist_id}")
-            return "Task was cancelled"
+        if task_id:
+            task_status = await task_manager.get_task_status(task_id)
+            if task_status == TaskStatus.CANCELLED:
+                print(f"Task cancelled after transcript fetching for playlist {playlist_id}")
+                return "Task was cancelled"
         
         # Convert results to VideoData objects with transcripts
         video_data_list = []
         for video_url, transcript in transcript_results.items():
             # Check cancellation during video processing
-            if is_task_cancelled(userId, playlist_id, is_playlist=True):
-                print(f"Task cancelled during video data processing for playlist {playlist_id}")
-                return "Task was cancelled"
+            if task_id:
+                task_status = await task_manager.get_task_status(task_id)
+                if task_status == TaskStatus.CANCELLED:
+                    print(f"Task cancelled during video data processing for playlist {playlist_id}")
+                    return "Task was cancelled"
                 
             video_id = video_url.split("v=")[1].split("&")[0] if "v=" in video_url else video_url.split("/")[-1]
             video_data = VideoData(video_id, playlist_id, userId, api_key)
@@ -560,9 +633,11 @@ async def streaming_playlist_pipeline(playlist_id, userId, api_key, max_concurre
         return None
     
     # Check cancellation before starting Stage 2
-    if is_task_cancelled(userId, playlist_id, is_playlist=True):
-        print(f"Task cancelled before Stage 2 for playlist {playlist_id}")
-        return "Task was cancelled"
+    if task_id:
+        task_status = await task_manager.get_task_status(task_id)
+        if task_status == TaskStatus.CANCELLED:
+            print(f"Task cancelled before Stage 2 for playlist {playlist_id}")
+            return "Task was cancelled"
     
     # STAGE 2: Streaming processing pipeline (translate → summarize → collect)
     print(f"🔄 Stage 2: Starting streaming processing pipeline...")
@@ -582,7 +657,7 @@ async def streaming_playlist_pipeline(playlist_id, userId, api_key, max_concurre
     translate_workers = []
     for i in range(num_workers):
         worker = asyncio.create_task(
-            translate_stage_worker(translate_queue, summarize_queue, userId, playlist_id, api_key)
+            translate_stage_worker(translate_queue, summarize_queue, userId, playlist_id, api_key, task_id)
         )
         translate_workers.append(worker)
     
@@ -590,7 +665,7 @@ async def streaming_playlist_pipeline(playlist_id, userId, api_key, max_concurre
     summarize_workers = []
     for i in range(num_workers):
         worker = asyncio.create_task(
-            summarize_stage_worker(summarize_queue, results_queue, userId, playlist_id, api_key)
+            summarize_stage_worker(summarize_queue, results_queue, userId, playlist_id, api_key, task_id)
         )
         summarize_workers.append(worker)
     
@@ -601,9 +676,11 @@ async def streaming_playlist_pipeline(playlist_id, userId, api_key, max_concurre
     try:
         while videos_processed < len(video_data_list):
             # Check for cancellation
-            if is_task_cancelled(userId, playlist_id, is_playlist=True):
-                print("❌ Task cancelled during streaming processing")
-                break
+            if task_id:
+                task_status = await task_manager.get_task_status(task_id)
+                if task_status == TaskStatus.CANCELLED:
+                    print("❌ Task cancelled during streaming processing")
+                    break
                 
             # Get completed video
             video_data = await results_queue.get()
@@ -630,7 +707,7 @@ async def streaming_playlist_pipeline(playlist_id, userId, api_key, max_concurre
         
     return completed_videos
 
-async def generate_final_playlist_summary(completed_videos, playlist_id, api_key):
+async def generate_final_playlist_summary(completed_videos, playlist_id, api_key, task_id=None):
     """Generate final playlist summary from completed video summaries"""
     if not completed_videos:
         return "No videos were successfully processed."
@@ -679,63 +756,79 @@ summaries: {combined_summaries}""",
     
     return final_summary
 
-async def summarizePlaylist(playlist_id, userId, api_key, browserless_api_key=None):
+async def summarizePlaylist(playlist_id, userId, api_key, browserless_api_key=None, task_id=None):
     """
     Streaming playlist summarizer that processes videos through concurrent pipeline stages
     Each video flows through: fetch → translate → summarize → collect
     """
-    print("🚀 Starting streaming playlist summarization:", playlist_id)
+    print(f"🚀 Starting streaming playlist summarization: {playlist_id}, task: {task_id}")
     
-    # Register this task
-    register_task(userId, playlist_id, is_playlist=True)
+    # Update task status to running
+    if task_id:
+        await task_manager.update_task(task_id, status=TaskStatus.RUNNING, progress=5, message="Starting playlist summarization")
     
     try:
         # Check if playlist summary already exists in centralized vector store
         cached_summary = fetcher._get_cached_summary_from_vector_store(playlist_id=playlist_id)
         if cached_summary:
             print("📦 Found cached playlist summary in centralized vector store")
-            unregister_task(userId, playlist_id, is_playlist=True)
+            # Return cached summary (background task will handle WebSocket update)
             return cached_summary
         
         # Check for cancellation before starting pipeline
-        if is_task_cancelled(userId, playlist_id, is_playlist=True):
-            print(f"Task cancelled: summarize playlist {playlist_id} - before starting pipeline")
-            unregister_task(userId, playlist_id, is_playlist=True)
-            return "Task was cancelled"
+        if task_id:
+            task_status = await task_manager.get_task_status(task_id)
+            if task_status == TaskStatus.CANCELLED:
+                print(f"Task cancelled: summarize playlist {playlist_id} - before starting pipeline")
+                return "Task was cancelled"
+        
+        # Update progress
+        if task_id:
+            await task_manager.update_task(task_id, progress=10, message="Starting video processing pipeline")
         
         # Run streaming pipeline
         print("🔄 Starting streaming pipeline...")
-        completed_videos = await streaming_playlist_pipeline(playlist_id, userId, api_key, max_concurrent=3, browserless_api_key=browserless_api_key)
+        completed_videos = await streaming_playlist_pipeline(playlist_id, userId, api_key, max_concurrent=3, 
+                                                           browserless_api_key=browserless_api_key, task_id=task_id)
         
         # Check for cancellation after pipeline
-        if is_task_cancelled(userId, playlist_id, is_playlist=True):
-            print(f"Task cancelled: summarize playlist {playlist_id} - after pipeline")
-            unregister_task(userId, playlist_id, is_playlist=True)
-            return "Task was cancelled"
+        if task_id:
+            task_status = await task_manager.get_task_status(task_id)
+            if task_status == TaskStatus.CANCELLED:
+                print(f"Task cancelled: summarize playlist {playlist_id} - after pipeline")
+                return "Task was cancelled"
         
         # Handle case where no videos were processed successfully
         if not completed_videos:
-            unregister_task(userId, playlist_id, is_playlist=True)
+            if task_id:
+                await task_manager.update_task(task_id, status=TaskStatus.FAILED, progress=100, 
+                                             message="No videos could be processed", error="No videos could be processed successfully from this playlist.")
             return "No videos could be processed successfully from this playlist."
+        
+        # Update progress
+        if task_id:
+            await task_manager.update_task(task_id, progress=85, message="Generating final playlist summary")
         
         # Generate final playlist summary
         print("🔄 Generating final playlist summary...")
-        final_summary = await generate_final_playlist_summary(completed_videos, playlist_id, api_key)
+        final_summary = await generate_final_playlist_summary(completed_videos, playlist_id, api_key, task_id=task_id)
         
         # Final cancellation check
-        if is_task_cancelled(userId, playlist_id, is_playlist=True):
-            print(f"Task cancelled: summarize playlist {playlist_id} - after final summary")
-            unregister_task(userId, playlist_id, is_playlist=True)
-            return "Task was cancelled"
+        if task_id:
+            task_status = await task_manager.get_task_status(task_id)
+            if task_status == TaskStatus.CANCELLED:
+                print(f"Task cancelled: summarize playlist {playlist_id} - after final summary")
+                return "Task was cancelled"
         
-        # Unregister completed task
-        unregister_task(userId, playlist_id, is_playlist=True)
+        # Return final summary (background task will handle WebSocket update)
         print(f"✅ Playlist summarization completed successfully!")
         return final_summary
         
     except Exception as e:
-        # Make sure to unregister on error
-        unregister_task(userId, playlist_id, is_playlist=True)
+        # Make sure to update task status on error
+        if task_id:
+            await task_manager.update_task(task_id, status=TaskStatus.FAILED, progress=100, 
+                                         message="Playlist summarization failed", error=str(e))
         print(f"❌ Error in summarizePlaylist: {e}")
         raise e
  
