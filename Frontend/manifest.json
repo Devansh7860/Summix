@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "Summix",
+  "version": "1.0.0",
+  "description": "Summarize YouTube videos and playlists with AI.",
+  "permissions": [
+    "sidePanel",
+    "activeTab",
+    "storage",
+    "tabs",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://*.youtube.com/*"
+  ],
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Open Summix"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://*.youtube.com/*"],
+      "js": ["src/content.js"],
+      "run_at": "document_end"
+    }
+  ],
+  "options_page": "options.html",
+  "side_panel": {
+    "default_path": "index.html"
+  }
+}
