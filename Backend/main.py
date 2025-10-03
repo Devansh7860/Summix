@@ -114,12 +114,14 @@ async def summarize_playlist_background(playlist_id: str, user_id: str, api_key:
 
 app = FastAPI()
 
+# Enhanced CORS configuration for Chrome extensions
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # or ["*"] for all
+    allow_origins=["*"],  # Allow all origins including Chrome extensions
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["*", "Authorization", "Content-Type", "X-Requested-With"],
+    expose_headers=["*"]
 )
 
 # Start periodic cleanup task
@@ -470,6 +472,12 @@ async def summarize_playlist(data: Playlist, request: Request):
     
     # Return immediately with task info
     return {"task_id": task_id, "status": "started", "message": "Playlist summarization started"}
+
+# Explicit OPTIONS handler for cancel endpoint
+@app.options("/cancel")
+async def cancel_options():
+    """Handle preflight requests for cancel endpoint"""
+    return {"message": "OK"}
 
 @app.post("/cancel")
 async def cancel_processing(data: CancelRequest, request: Request):
