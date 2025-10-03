@@ -273,7 +273,7 @@ class TranscriptFetcher:
         except Exception as e:
             print(f"❌ Error caching transcript: {e}")
     
-    def _get_cached_summary_from_vector_store(self, video_id: str | bool = None, playlist_id: bool = False) -> Optional[str]:
+    def _get_cached_summary_from_vector_store(self, video_id: str | bool = None, playlist_id: str| bool = False) -> Optional[str]:
         """Get cached summary from vector store."""
         if not self.vector_store:
             return None
@@ -286,6 +286,9 @@ class TranscriptFetcher:
                 filter_dict["videoId"] = video_id
             if playlist_id:
                 filter_dict["playlistId"] = playlist_id
+                if video_id:
+                    del filter_dict["videoId"]
+            
             
             # Search for summary
             results = self.vector_store.similarity_search(

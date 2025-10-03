@@ -145,10 +145,8 @@ def fetch_transcript(video_id, api_key, browserless_api_key=None, userId=None, t
         return None
 
 prompt = PromptTemplate(
-    template = """ You are an AI assistant that summarizes YouTube videos based on their transcripts.  
-        Treat the user like a bro. keep language semi formal but friendly and chill. 
-
-Instructions:
+    template = """ You are Summix, an AI assistant that summarizes YouTube videos based on their transcripts.  
+    Treat the user like a bro. keep language semi formal but friendly and chill.Instructions:
 - Write the summary in clear, simple language.  
 - Highlight the main topics and ideas, not filler words or repetition.  
 - If timestamps are available, include them with key points.  
@@ -381,7 +379,7 @@ def ask(video_id, playlist_id, question, userId, api_key):
         
         # Create the prompt for answering questions
         prompt = PromptTemplate(
-            template="""You are an AI assistant that answers questions about YouTube videos based on their transcripts or summaries.
+            template="""You are Summix, an AI assistant that answers questions about YouTube videos based on their transcripts or summaries.
             If the answer is not present in the context, say "I don't know based on the provided content."
             Keep your language friendly and conversational.
             
@@ -469,152 +467,180 @@ async def streaming_playlist_pipeline(playlist_id, userId, api_key, max_concurre
     # Create fetcher instance
     temp_fetcher = TranscriptFetcher(rate_limit_delay=2, browserless_api_key=browserless_api_key) if browserless_api_key else fetcher
     
-    print(f"🔄 Starting TRUE streaming processing: fetch → process → repeat")
+    print(f"🔄 SMART CACHING: First checking what videos are already processed...")
     
-    # Process each video individually with cancellation checks
+    # STEP 1: Check all videos for existing summaries BEFORE processing anything
+    videos_to_process = []
+    already_cached_videos = []
+    
     for i, video_url in enumerate(video_urls, 1):
-        # Check cancellation before each video
-        if task_id:
-            task_status = await task_manager.get_task_status(task_id)
-            if task_status == TaskStatus.CANCELLED:
-                print(f"❌ Task cancelled while processing video {i}/{total_videos}")
-                break
-        
         video_id = extract_video_id(video_url)
         if not video_id:
             print(f"❌ Invalid video URL: {video_url}")
             continue
-        print(f"\n🎯 Processing video {i}/{total_videos}: {video_id}")
-        
-        # Update progress for this video
-        if task_id:
-            progress = 10 + (i * 70 // total_videos)  # 10-80% for individual videos
-            await task_manager.update_task(task_id, progress=progress, 
-                                         message=f"Processing video {i}/{total_videos}: {video_id}")
-        
-        try:
-            # STEP 1: Fetch transcript for this video only
-            print(f"📄 Fetching transcript for video {video_id}...")
             
-            def _fetch_single_transcript():
-                return temp_fetcher.get_transcript(video_url)
-            
-            transcript = await asyncio.to_thread(_fetch_single_transcript)
-            
-            # Check cancellation after transcript fetch
-            if task_id:
-                task_status = await task_manager.get_task_status(task_id)
-                if task_status == TaskStatus.CANCELLED:
-                    print(f"❌ Task cancelled after fetching transcript for video {video_id}")
-                    break
-            
-            if not transcript:
-                print(f"❌ No transcript available for video {video_id}")
-                continue
-            
-            print(f"✅ Transcript fetched for video {video_id}")
-            
-            # STEP 2: Create video data object
+        # Check if this video summary already exists
+        cached_summary = fetcher._get_cached_summary_from_vector_store(video_id=video_id)
+        if cached_summary:
+            print(f"📦 Video {i}/{total_videos} already cached: {video_id}")
+            # Create video data object for cached video
             video_data = VideoData(video_id, playlist_id, userId, api_key)
-            video_data.transcript = transcript
-            
-            # STEP 3: Process translation if needed
-            print(f"🔄 Processing translation for video {video_id}...")
-            hindi_chars = set('अआइईउऊऋएऐओऔकखगघचछजझटठडढणतथदधनपफबभमयरलवशषसह')
-            if any(char in hindi_chars for char in transcript[:1000]):
-                print(f"Hindi transcript detected for video {video_id}, translating...")
-                try:
-                    def _translate_sync():
-                        return translate_hindi_to_english(transcript, api_key)
-                    
-                    video_data.transcript = await asyncio.to_thread(_translate_sync)
-                    print(f"✅ Translation completed for video {video_id}")
-                except Exception as e:
-                    print(f"❌ Translation failed for video {video_id}: {e}")
-                    # Continue with original transcript
-            
-            # Check cancellation after translation
+            video_data.summary = cached_summary
+            video_data.cached = True
+            already_cached_videos.append(video_data)
+        else:
+            print(f"🔄 Video {i}/{total_videos} needs processing: {video_id}")
+            videos_to_process.append((i, video_url, video_id))
+    
+    print(f"📊 SMART CACHE RESULTS: {len(already_cached_videos)} cached, {len(videos_to_process)} to process")
+    
+    # Add all cached videos to completed list first
+    completed_videos.extend(already_cached_videos)
+    
+    # If no videos need processing, skip to final summary
+    if not videos_to_process:
+        print("🎉 All videos already cached! Skipping to final summary...")
+        if task_id:
+            await task_manager.update_task(task_id, progress=80, message="All videos cached, generating final summary")
+    else:
+        print(f"🔄 Starting TRUE streaming processing for {len(videos_to_process)} remaining videos")
+        
+        # STEP 2: Process only the videos that need processing
+        for video_index, video_url, video_id in videos_to_process:
+            # Check cancellation before each video
             if task_id:
                 task_status = await task_manager.get_task_status(task_id)
                 if task_status == TaskStatus.CANCELLED:
-                    print(f"❌ Task cancelled after translation for video {video_id}")
+                    print(f"❌ Task cancelled while processing video {video_index}/{total_videos}")
                     break
             
-            # STEP 4: Generate summary
-            print(f"🤖 Generating AI summary for video {video_id}...")
+            print(f"\n🎯 Processing video {video_index}/{total_videos}: {video_id}")
             
-            # Check if summary already cached
-            cached_summary = fetcher._get_cached_summary_from_vector_store(video_id=video_id)
-            if cached_summary:
-                print(f"📦 Using cached summary for video {video_id}")
-                video_data.summary = cached_summary
-                video_data.cached = True
-            else:
-                # Generate new summary
-                try:
-                    prompt = PromptTemplate(
-                        template="""You are an AI assistant that summarizes YouTube videos based on their transcripts.  
-                        Treat the user like a bro. keep language semi formal but friendly and chill.
-
-                        Please provide a comprehensive summary with:
-
-                        1. **Overview**: What is this video about in 2-3 sentences?
-
-                        2. **Key Concepts & Ideas**: List the main concepts, ideas, or topics covered (use bullet points)
-
-                        3. **Important Details**: Any specific facts, examples, or explanations that are crucial for understanding
-
-                        4. **Practical Takeaways**: What should someone remember or apply after watching this video?
-
-                        Please make sure your summary is:
-                        - Clear and well-structured  
-                        - Comprehensive but concise
-                        - Educational and easy to understand
-                        - Written in a friendly, approachable tone
-
-                        Transcript: {context}""",
-                        input_variables=["context"]
-                    )
-                    
-                    model = create_model(api_key)
-                    chain = prompt | model | parser
-                    
-                    # Check cancellation before AI processing
-                    if task_id:
-                        task_status = await task_manager.get_task_status(task_id)
-                        if task_status == TaskStatus.CANCELLED:
-                            print(f"❌ Task cancelled before AI processing for video {video_id}")
-                            break
-                    
-                    summary = await asyncio.to_thread(chain.invoke, {"context": video_data.transcript})
-                    
-                    # Check cancellation after AI processing
-                    if task_id:
-                        task_status = await task_manager.get_task_status(task_id)
-                        if task_status == TaskStatus.CANCELLED:
-                            print(f"❌ Task cancelled after AI processing for video {video_id} - not caching")
-                            break
-                    
-                    # Cache summary only if not cancelled
-                    fetcher._cache_summary_to_vector_store(summary, video_id=video_id, playlist_id=playlist_id)
-                    video_data.summary = summary
-                    print(f"✅ AI summary generated and cached for video {video_id}")
-                    
-                except Exception as e:
-                    print(f"❌ Error generating summary for video {video_id}: {e}")
-                    video_data.error = f"Error generating summary: {e}"
+            # Update progress for this video
+            # Update progress for this video
+            if task_id:
+                progress = 10 + ((len(already_cached_videos) + len([v for v in videos_to_process if v[0] <= video_index])) * 70 // total_videos)
+                await task_manager.update_task(task_id, progress=progress, 
+                                             message=f"Processing video {video_index}/{total_videos}: {video_id}")
+            
+            try:
+                # STEP 1: Fetch transcript for this video only
+                print(f"📄 Fetching transcript for video {video_id}...")
+                
+                def _fetch_single_transcript():
+                    return temp_fetcher.get_transcript(video_url)
+                
+                transcript = await asyncio.to_thread(_fetch_single_transcript)
+                
+                # Check cancellation after transcript fetch
+                if task_id:
+                    task_status = await task_manager.get_task_status(task_id)
+                    if task_status == TaskStatus.CANCELLED:
+                        print(f"❌ Task cancelled after fetching transcript for video {video_id}")
+                        break
+                
+                if not transcript:
+                    print(f"❌ No transcript available for video {video_id}")
                     continue
-            
-            # Add completed video to results
-            completed_videos.append(video_data)
-            videos_processed += 1
-            print(f"🎉 Video {video_id} completed successfully ({videos_processed}/{total_videos})")
-            
-        except Exception as e:
-            print(f"❌ Error processing video {video_id}: {e}")
-            continue
+                
+                print(f"✅ Transcript fetched for video {video_id}")
+                
+                # STEP 2: Create video data object
+                video_data = VideoData(video_id, playlist_id, userId, api_key)
+                video_data.transcript = transcript
+                
+                # STEP 3: Process translation if needed
+                print(f"🔄 Processing translation for video {video_id}...")
+                hindi_chars = set('अआइईउऊऋएऐओऔकखगघचछजझटठडढणतथदधनपफबभमयरलवशषसह')
+                if any(char in hindi_chars for char in transcript[:1000]):
+                    print(f"Hindi transcript detected for video {video_id}, translating...")
+                    try:
+                        def _translate_sync():
+                            return translate_hindi_to_english(transcript, api_key)
+                        
+                        video_data.transcript = await asyncio.to_thread(_translate_sync)
+                        print(f"✅ Translation completed for video {video_id}")
+                    except Exception as e:
+                        print(f"❌ Translation failed for video {video_id}: {e}")
+                        # Continue with original transcript
+                
+                # Check cancellation after translation
+                if task_id:
+                    task_status = await task_manager.get_task_status(task_id)
+                    if task_status == TaskStatus.CANCELLED:
+                        print(f"❌ Task cancelled after translation for video {video_id}")
+                        break
+                
+                # STEP 4: Generate summary (no need to check cache since we already filtered)
+                print(f"🤖 Generating AI summary for video {video_id}...")
+                
+                # Generate new summary since this video wasn't cached
+                prompt = PromptTemplate(
+                    template="""You are Summix, an AI assistant that summarizes YouTube videos based on their transcripts.  
+                    Treat the user like a bro. keep language semi formal but friendly and chill.
+
+                    Please provide a comprehensive summary with:
+
+                    1. **Overview**: What is this video about in 2-3 sentences?
+
+                    2. **Key Concepts & Ideas**: List the main concepts, ideas, or topics covered (use bullet points)
+
+                    3. **Important Details**: Any specific facts, examples, or explanations that are crucial for understanding
+
+                    4. **Practical Takeaways**: What should someone remember or apply after watching this video?
+
+                    Please make sure your summary is:
+                    - Clear and well-structured  
+                    - Comprehensive but concise
+                    - Educational and easy to understand
+                    - Written in a friendly, approachable tone
+
+                    Transcript: {context}""",
+                    input_variables=["context"]
+                )
+                
+                model = create_model(api_key)
+                chain = prompt | model | parser
+                
+                # Check cancellation before AI processing
+                if task_id:
+                    task_status = await task_manager.get_task_status(task_id)
+                    if task_status == TaskStatus.CANCELLED:
+                        print(f"❌ Task cancelled before AI processing for video {video_id}")
+                        break
+                
+                summary = await asyncio.to_thread(chain.invoke, {"context": video_data.transcript})
+                
+                # Check cancellation after AI processing
+                if task_id:
+                    task_status = await task_manager.get_task_status(task_id)
+                    if task_status == TaskStatus.CANCELLED:
+                        print(f"❌ Task cancelled after AI processing for video {video_id} - not caching")
+                        break
+                
+                # Cache summary only if not cancelled
+                fetcher._cache_summary_to_vector_store(summary, video_id=video_id, playlist_id=playlist_id)
+                video_data.summary = summary
+                print(f"✅ AI summary generated and cached for video {video_id}")
+                
+                # Add completed video to results
+                completed_videos.append(video_data)
+                videos_processed += 1
+                print(f"🎉 Video {video_id} completed successfully")
+                
+            except Exception as e:
+                print(f"❌ Error processing video {video_id}: {e}")
+                continue
     
+    # Sort completed videos to maintain original playlist order
+    # The cached videos were added first, then processed videos, so we need to sort by video index
     print(f"📊 Streaming pipeline complete: {len(completed_videos)}/{total_videos} videos processed")
+    
+    # DEBUG: Log what videos were completed
+    for i, video in enumerate(completed_videos):
+        cached_status = "(cached)" if hasattr(video, 'cached') and video.cached else "(new)"
+        print(f"🎯 Video {i+1}: {video.video_id} {cached_status}")
+    
     return completed_videos
 
 
@@ -624,6 +650,13 @@ async def generate_final_playlist_summary(completed_videos, playlist_id, api_key
         return "No videos were successfully processed."
         
     print(f"📋 Generating final playlist summary from {len(completed_videos)} videos")
+    
+    # DEBUG: Log what we're working with
+    print(f"🔍 DEBUG: About to combine {len(completed_videos)} video summaries:")
+    for i, video_data in enumerate(completed_videos):
+        summary_preview = video_data.summary[:100] + "..." if len(video_data.summary) > 100 else video_data.summary
+        cached_status = "(cached)" if hasattr(video_data, 'cached') and video_data.cached else "(new)"
+        print(f"   Video {i+1} {cached_status}: {summary_preview}")
     
     # Combine all individual summaries
     combined_summaries = "\n\n".join([
@@ -701,6 +734,9 @@ async def summarizePlaylist(playlist_id, userId, api_key, browserless_api_key=No
         print("🔄 Starting streaming pipeline...")
         completed_videos = await streaming_playlist_pipeline(playlist_id, userId, api_key, max_concurrent=3, 
                                                            browserless_api_key=browserless_api_key, task_id=task_id)
+        
+        # DEBUG: Check what the pipeline returned
+        print(f"🔍 DEBUG: Pipeline returned {len(completed_videos) if completed_videos else 0} completed videos")
         
         # Check for cancellation after pipeline
         if task_id:
