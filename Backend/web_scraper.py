@@ -6,6 +6,9 @@ import re
 import requests
 import time
 from typing import Optional, List, Dict
+from dotenv import load_dotenv
+load_dotenv()
+import os
 
 try:
     from bs4 import BeautifulSoup
@@ -15,7 +18,7 @@ except ImportError:
     print("⚠️  BeautifulSoup not installed. Install with: pip install beautifulsoup4")
 
 # Browserless.io API configuration
-BROWSERLESS_API_KEY = "2T9IYdLEgrhmoZYa6510e1a6d38be8c1e8d6debd4012fb7e3"
+BROWSERLESS_API_KEY = os.getenv("BROWSERLESS_API_KEY" , "YOUR_API_KEY_HERE")
 BROWSERLESS_ENDPOINT = f"https://production-sfo.browserless.io/content?token={BROWSERLESS_API_KEY}"
 BROWSERLESS_ENABLED = bool(BROWSERLESS_API_KEY and BROWSERLESS_API_KEY != "YOUR_API_KEY_HERE")
 
