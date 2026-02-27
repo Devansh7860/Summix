@@ -2,6 +2,9 @@
 
 **Summix** is a powerful Chrome extension that uses AI to summarize YouTube videos and playlists in real-time. Get instant insights, key takeaways, and comprehensive summaries without watching entire videos.
 
+<img width="1920" height="968" alt="image" src="https://github.com/user-attachments/assets/2bb2472f-ac76-41ec-a77c-c831ffa727aa" />
+
+
 ## ✨ Features
 
 ### 🎥 **Video Summarization**
